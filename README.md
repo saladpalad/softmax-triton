@@ -5,7 +5,7 @@
 python3 softmax.py
 ```
 
-## Results
+## Results on RTX 3060 Ti
 ```
 torch_out=tensor([[0.0117, 0.0317, 0.0861, 0.2341, 0.6364],
         [0.6364, 0.2341, 0.0861, 0.0317, 0.0117]], device='cuda:0')
