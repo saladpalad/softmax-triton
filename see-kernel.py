@@ -18,5 +18,5 @@ sample = torch.randn(100, 100)
 opt_softmax = torch.compile(torch_softmax)
 
 # Run the optimized function
-opt_softmax_out = torch_softmax(sample.cuda()) 
+opt_softmax_out = opt_softmax(sample.cuda()) 
 print(opt_softmax_out)

@@ -5,9 +5,10 @@ import torch.nn.functional as F
 import time
 import os
 #os.environ['TORCH_LOGS'] = 'output_code'
-TORCH_LOGS = "OUTPUT_CODE" 
+#TORCH_LOGS = "OUTPUT_CODE" 
 
-def torch_softmax(x: torch.Tensor) -> torch.Tensor:
+@torch.compile
+def torch_opt_softmax(x: torch.Tensor) -> torch.Tensor:
     return F.softmax(x, dim=1)
 
 def naive_softmax(x: torch.Tensor)-> torch.Tensor:
@@ -44,6 +45,89 @@ def online_softmax(x: torch.Tensor) -> torch.Tensor:
         y[r,:] = torch.exp(x_i - m_V) / d_V
 
     return y
+
+@triton.jit
+def _online_softmax_fwd_kernel(x_ptr, z_ptr, N0, T, B0: tl.constexpr, B1: tl.constexpr):
+    pid_0 = tl.program_id(0)
+    log2_e = 1.44269504
+    
+    # batch refers to rows
+    batch_range = tl.arange(0, B0) + pid_0*B0
+    batch_mask = batch_range < N0
+
+    #exp2 = lambda x: tl.tl.exp(log2_e * x)
+
+    prev_max = tl.zeros((B0,), dtype=tl.float32)
+    max_batch = tl.zeros((B0,), dtype=tl.float32)
+    denom = tl.zeros((B0,), dtype=tl.float32)
+
+    for i in range(0, T, B1):
+        # normal setup
+        b_offset = tl.arange(0,B1) + i
+        offset_mask = b_offset < T
+
+        x_range = batch_range[None,:] * T + b_offset[:,None]
+        x_mask = batch_mask[None,:] & offset_mask[:,None]
+
+        x_batch = tl.load(x_ptr + x_range, x_mask, other=0) #32x1
+
+        #now we keep track of running max and norm term
+        x_batch_max = tl.max(x_batch)
+        prev_max = max_batch
+
+        # update batch of max vals
+        max_batch = tl.maximum(x_batch_max, prev_max) #returns a tensor
+
+        # keep track of running normalization term
+        denom = denom * tl.exp(prev_max - max_batch) + tl.sum(tl.exp(x_batch - max_batch), axis=0)
+
+    for i in range(0, T, B1):
+        # normal setup again
+        b_offset = tl.arange(0,B1) + i
+        offset_mask = b_offset < T
+
+        x_range = batch_range[None,:] * T + b_offset[:,None]
+        x_mask = batch_mask[None,:] & offset_mask[:,None]
+
+        x_batch = tl.load(x_ptr + x_range, x_mask, other=0) #32x1
+
+        ### calculate the output matrix z...
+        z = tl.exp(x_batch - max_batch) / denom
+
+        tl.store(z_ptr + x_range, z, x_mask)
+
+
+
+def triton_online_softmax(x: torch.Tensor) -> torch.Tensor:
+    """ Triton impl of online softmax """
+    rows, cols = x.shape
+    B0 = triton.next_power_of_2(rows)
+    B1 = triton.next_power_of_2(cols) # 1000 cols -> 1024 block_size
+    num_warps = 4 # 32 threads
+    if B1 >= 2048:
+        num_warps = 8
+    if B1 >= 4096:
+        num_warps = 16
+
+    grid = (rows,) # launch a kernel for each row
+
+    # allocate output buffer
+    sm_out = torch.empty_like(x)
+    #print(x.stride(0))
+
+    _online_softmax_fwd_kernel[grid](
+        x,
+        sm_out,
+        rows,
+        cols,
+        B0,
+        B1
+    #    block_size=block_size,
+    #    num_warps=num_warps,
+    )
+
+    return sm_out
+
 
 @triton.jit
 def _softmax_fwd_kernel(output_ptr, stride_output_row, input_ptr, stride_input_row, num_cols, block_size: tl.constexpr):
@@ -113,21 +197,28 @@ end = time.perf_counter()
 print(f"{eager_out=}")
 eager_time = end-start
 
-
 start = time.perf_counter()
 online_out = online_softmax(sample)
 end = time.perf_counter()
 print(f"{online_out=}")
 online_time = end-start
 
-#start = time.perf_counter()
-#triton_out = softmax(sample)
-#end = time.perf_counter()
-#print(f"{triton_out=}")
-#triton_time = end-start
+start = time.perf_counter()
+triton_out = classic_softmax(sample)
+end = time.perf_counter()
+print(f"{triton_out=}")
+triton_time = end-start
 
-#print(f"{torch_time=}\n{eager_time=}\n{triton_time=}\n{online_time=}\n")
+start = time.perf_counter()
+triton_online_out = triton_online_softmax(sample)
+end = time.perf_counter()
+print(f"{triton_online_out=}")
+triton_online_time = end - start
 
-opt_softmax = torch.compile(torch_softmax)
-opt_softmax_out = opt_softmax(sample)
-print(opt_softmax_out)
+start = time.perf_counter()
+torch_opt_out = torch_opt_softmax(sample) 
+end = time.perf_counter()
+print(f"{torch_opt_out=}")
+torch_opt_time = end-start
+
+print(f"{torch_time=}\n{eager_time=}\n{triton_time=}\n{online_time=}\n{triton_online_time=}\n{torch_opt_time=}\n")
